@@ -6,7 +6,6 @@ venv/
 *.pth
 data/
 datasets/
-mnist_split_split_indices.pt
 # checkpoints/
 .DS_Store
 Thumbs.db
