@@ -269,9 +269,7 @@ def train_translators(args):
     print("Saved translator + discriminator models.")
 
 
-# --------------------------------------------------------
-# CLI
-# --------------------------------------------------------
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--device", default="cpu", choices=["cpu", "cuda"])

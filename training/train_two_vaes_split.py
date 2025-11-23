@@ -31,32 +31,6 @@ def stratified_split_indices(labels, seed: int = 0):
     idxB = torch.cat(idxB).tolist()
     return idxA, idxB
 
-
-# def train_vae(model: VAE, loader: DataLoader, device: str, epochs: int, lr: float):
-#     model.to(device)
-#     optimizer = optim.Adam(model.parameters(), lr=lr)
-#     model.train()
-#     for epoch in range(1, epochs + 1):
-#         total_loss = 0.0
-#         total_recon = 0.0
-#         total_kl = 0.0
-#         n_batches = 0
-#         for x, _ in loader:
-#             x = x.to(device)
-#             optimizer.zero_grad()
-#             loss, recon, kl = model(x)
-#             loss.backward()
-#             optimizer.step()
-
-#             total_loss += loss.item()
-#             total_recon += recon.item()
-#             total_kl += kl.item()
-#             n_batches += 1
-#         print(f"[Epoch {epoch:3d}] "
-#               f"Loss={total_loss / n_batches:.4f} "
-#               f"Recon={total_recon / n_batches:.4f} "
-#               f"KL={total_kl / n_batches:.4f}")
-#     return model
 def train_vae(model, loader, device, epochs: int, lr: float):
     model.to(device)
     optimizer = optim.Adam(model.parameters(), lr=lr)

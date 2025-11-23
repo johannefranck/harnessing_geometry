@@ -4,7 +4,7 @@ from torch.utils.data import DataLoader
 from torchvision import datasets, transforms
 
 from models.simple_vae import VAE
-from training.train_translators_planA_adv import TranslatorMLP  # reuse the same class
+from training.train_translators_planA_adv import TranslatorMLP 
 
 
 def collect_latents(vae: VAE, loader: DataLoader, device: str, max_samples: int):
