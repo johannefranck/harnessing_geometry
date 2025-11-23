@@ -2,12 +2,12 @@ __pycache__/
 *.pyc
 venv/
 .venv/
-*.pt
+# *.pt
 *.pth
 data/
 datasets/
 mnist_split_split_indices.pt
-checkpoints/
+# checkpoints/
 .DS_Store
 Thumbs.db
 .ipynb_checkpoints/
