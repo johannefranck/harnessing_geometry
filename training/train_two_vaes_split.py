@@ -9,11 +9,7 @@ from models.supervised_vae import SupervisedVAE
 
 
 def stratified_split_indices(labels, seed: int = 0):
-    """Split indices into two disjoint halves, roughly balanced per label.
-
-    labels: 1D tensor or list of ints (length N)
-    Returns: idxA, idxB as lists of indices
-    """
+    """Split indices into two disjoint halves, roughly balanced per label."""
     labels = torch.as_tensor(labels)
     num_classes = int(labels.max().item() + 1)
     g = torch.Generator()
@@ -30,6 +26,7 @@ def stratified_split_indices(labels, seed: int = 0):
     idxA = torch.cat(idxA).tolist()
     idxB = torch.cat(idxB).tolist()
     return idxA, idxB
+
 
 def train_vae(model, loader, device, epochs: int, lr: float):
     model.to(device)
@@ -63,6 +60,26 @@ def train_vae(model, loader, device, epochs: int, lr: float):
 
     return model
 
+
+def collect_latents(model, loader, device):
+    """
+    Run the *trained* VAE encoder once over the given loader
+    and return (z_mu, labels).
+    """
+    model.eval()
+    zs = []
+    ys = []
+    with torch.no_grad():
+        for x, y in loader:
+            x = x.to(device)
+            mu, logvar = model.encode(x)   # SupervisedVAE.encode -> (mu, logvar)
+            zs.append(mu.cpu())
+            ys.append(y.clone())
+    z = torch.cat(zs, dim=0)
+    y = torch.cat(ys, dim=0)
+    return z, y
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--device", default="cpu", choices=["cpu", "cuda", "mps"])
@@ -71,7 +88,7 @@ def main():
     ap.add_argument("--latent-dim", type=int, default=8)
     ap.add_argument("--lr", type=float, default=1e-3)
     ap.add_argument("--data-root", type=str, default="data/")
-    ap.add_argument("--prefix", type=str, default="mnist_split")
+    ap.add_argument("--prefix", type=str, default="checkpoints/mnist_split")
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
 
@@ -81,15 +98,20 @@ def main():
 
     torch.manual_seed(args.seed)
 
-    # Load full MNIST train set once
+    # 1) Load MNIST and restrict to digits 1,2,3
     transform = transforms.ToTensor()
-    full_train = datasets.MNIST(args.data_root, train=True, download=True, transform=transform)
+    full_train = datasets.MNIST(
+        args.data_root, train=True, download=True, transform=transform
+    )
 
-    # Stratified split into A and B
-    labels = full_train.targets  # tensor of shape (60000,)
-    idxA, idxB = stratified_split_indices(labels, seed=args.seed)
+    mask = (full_train.targets == 1) | (full_train.targets == 2) | (full_train.targets == 3)
+    filtered_indices = mask.nonzero(as_tuple=False).view(-1)
+    full_train = Subset(full_train, filtered_indices)
 
-    # Save indices so we can reuse them later (for translator training)
+    # 2) Stratified split A vs B USING THE FILTERED LABELS
+    labels_subset = full_train.dataset.targets[full_train.indices]
+    idxA, idxB = stratified_split_indices(labels_subset, seed=args.seed)
+
     split_path = f"{args.prefix}_split_indices.pt"
     torch.save({"idxA": idxA, "idxB": idxB}, split_path)
     print(f"Saved split indices to {split_path}")
@@ -97,26 +119,32 @@ def main():
     dsA = Subset(full_train, idxA)
     dsB = Subset(full_train, idxB)
 
-    loaderA = DataLoader(dsA, batch_size=args.batch_size, shuffle=True,
-                         num_workers=0, pin_memory=False)
-    loaderB = DataLoader(dsB, batch_size=args.batch_size, shuffle=True,
-                         num_workers=0, pin_memory=False)
+    loaderA = DataLoader(dsA, batch_size=args.batch_size, shuffle=True)
+    loaderB = DataLoader(dsB, batch_size=args.batch_size, shuffle=True)
 
-    # Train VAE on domain A
+    # 3) Train VAE_A
     vaeA = SupervisedVAE(latent_dim=args.latent_dim)
     print("Training VAE_A on domain A...")
     vaeA = train_vae(vaeA, loaderA, device, epochs=args.epochs, lr=args.lr)
-    pathA = f"{args.prefix}_vaeA.pt"
-    torch.save(vaeA.state_dict(), pathA)
-    print(f"Saved VAE_A weights to {pathA}")
+    torch.save(vaeA.state_dict(), f"{args.prefix}_vaeA.pt")
 
-    # Train VAE on domain B
+    # 4) Train VAE_B
     vaeB = SupervisedVAE(latent_dim=args.latent_dim)
     print("Training VAE_B on domain B...")
     vaeB = train_vae(vaeB, loaderB, device, epochs=args.epochs, lr=args.lr)
-    pathB = f"{args.prefix}_vaeB.pt"
-    torch.save(vaeB.state_dict(), pathB)
-    print(f"Saved VAE_B weights to {pathB}")
+    torch.save(vaeB.state_dict(), f"{args.prefix}_vaeB.pt")
+
+    # 5) After training: collect and save latents once (no more encoder_B later)
+    #    Use deterministic order (shuffle=False)
+    loaderA_eval = DataLoader(dsA, batch_size=args.batch_size, shuffle=False)
+    loaderB_eval = DataLoader(dsB, batch_size=args.batch_size, shuffle=False)
+
+    zA, yA = collect_latents(vaeA.to(device), loaderA_eval, device)
+    zB, yB = collect_latents(vaeB.to(device), loaderB_eval, device)
+
+    torch.save({"z": zA, "y": yA}, f"{args.prefix}_zA_train.pt")
+    torch.save({"z": zB, "y": yB}, f"{args.prefix}_zB_train.pt")
+    print("Saved zA/zB train latents.")
 
 
 if __name__ == "__main__":

@@ -5,11 +5,11 @@ import torch.optim as optim
 from torch.utils.data import DataLoader, Subset
 from torchvision import datasets, transforms
 
-from models.simple_vae import VAE
-from training.train_translators_planA import TranslatorMLP
+from models.supervised_vae import SupervisedVAE
+from training.train_translators_planA_adv import TranslatorMLP, TranslatorFlow
 
 
-def collect_latents_with_labels(vae: VAE,
+def collect_latents_with_labels(vae,
                                 loader: DataLoader,
                                 device: str,
                                 max_samples: int):
@@ -53,27 +53,28 @@ def main():
     ap.add_argument("--latent-dim", type=int, default=8)
     ap.add_argument("--weights-vaeA", type=str, default="checkpoints/mnist_split_vaeA.pt")
     ap.add_argument("--weights-vaeB", type=str, default="checkpoints/mnist_split_vaeB.pt")
-    ap.add_argument("--weights-TBA", type=str, default="checkpoints/mnist_split_T_BA.pt")
+    ap.add_argument("--weights-TBA", type=str, default="checkpoints/mnist_split_T_AB.pt")
     ap.add_argument("--split-path", type=str, default="checkpoints/mnist_split_split_indices.pt")
     ap.add_argument("--data-root", type=str, default="data/")
     ap.add_argument("--batch-size", type=int, default=256)
     ap.add_argument("--max-train-samples", type=int, default=10000)
-    ap.add_argument("--max-test-samples", type=int, default=2000)
+    ap.add_argument("--max-test-samples", type=int, default=3000)
     ap.add_argument("--epochs", type=int, default=20)
     ap.add_argument("--lr", type=float, default=1e-3)
     args = ap.parse_args()
 
     device = args.device
 
-    # --- Load VAEs and translator ---
-    vaeA = VAE(latent_dim=args.latent_dim)
+    # --- Load VAEs (SupervisedVAE, matching training) ---
+    vaeA = SupervisedVAE(latent_dim=args.latent_dim)
     vaeA.load_state_dict(torch.load(args.weights_vaeA, map_location=device))
-    vaeB = VAE(latent_dim=args.latent_dim)
+    vaeB = SupervisedVAE(latent_dim=args.latent_dim)
     vaeB.load_state_dict(torch.load(args.weights_vaeB, map_location=device))
     vaeA.to(device)
     vaeB.to(device)
 
-    T_BA = TranslatorMLP(args.latent_dim)
+    # --- Load TranslatorFlow (we will use its inverse as B->A) ---
+    T_BA = TranslatorFlow(args.latent_dim)
     T_BA.load_state_dict(torch.load(args.weights_TBA, map_location=device))
     T_BA.to(device).eval()
 
@@ -82,8 +83,14 @@ def main():
     full_train = datasets.MNIST(
         args.data_root, train=True, download=True, transform=transform
     )
+
+    # Restrict to digits 1,2,3, consistent with your VAE training
+    mask = (full_train.targets == 1) | (full_train.targets == 2) | (full_train.targets == 3)
+    filtered_indices = mask.nonzero(as_tuple=False).view(-1)
+    full_train = Subset(full_train, filtered_indices)
+
     split = torch.load(args.split_path)
-    idxA = split["idxA"]   # indices for domain A (train side)
+    idxA = split["idxA"]   # indices for domain A (relative to filtered subset)
     dsA_train = Subset(full_train, idxA)
 
     train_loader_A = DataLoader(
@@ -97,8 +104,11 @@ def main():
     )
     print(f"Collected zA_train: {zA_train.shape}")
 
+    # ---- prepare the classifier to understand the digits correctly ---
+    y_train = y_train - 1  # {1,2,3} -> {0,1,2}
+
     # --- Define classifier in A-space ---
-    clf = LatentClassifier(latent_dim=args.latent_dim, num_classes=10).to(device)
+    clf = LatentClassifier(latent_dim=args.latent_dim, num_classes=3).to(device)
     optimizer = optim.Adam(clf.parameters(), lr=args.lr)
     criterion = nn.CrossEntropyLoss()
 
@@ -132,13 +142,16 @@ def main():
 
         avg_loss = total_loss / count
         acc = correct / count
-        print(f"[Epoch {epoch:2d}] train loss={avg_loss:.4f}, "
-              f"train acc={acc:.4f}")
+        print(f"[Epoch {epoch:2d}] train loss={avg_loss:.4f}, train acc={acc:.4f}")
 
-    # --- Prepare TEST data (unseen by VAEs, translators, and classifier) ---
-    test_set = datasets.MNIST(
-        args.data_root, train=False, download=True, transform=transform
-    )
+    # --- Prepare TEST data (filtered MNIST test) ---
+    test_full = datasets.MNIST(args.data_root, train=False, download=True, transform=transform)
+
+    mask = (test_full.targets == 1) | (test_full.targets == 2) | (test_full.targets == 3)
+    filtered_idx = mask.nonzero(as_tuple=False).view(-1)
+
+    test_set = Subset(test_full, filtered_idx)
+
     test_loader = DataLoader(
         test_set, batch_size=args.batch_size, shuffle=False,
         num_workers=0, pin_memory=False
@@ -153,6 +166,8 @@ def main():
     )
 
     print(f"Collected zA_test: {zA_test.shape}, zB_test: {zB_test.shape}")
+    # remap digits to match classifier training
+    y_test = y_test - 1  # {1,2,3} -> {0,1,2}
 
     # --- Evaluate classifier on A-test (baseline) ---
     clf.eval()
@@ -163,14 +178,15 @@ def main():
 
     print(f"Classifier accuracy on A-test (zA_test): {acc_A:.4f}")
 
-    # --- Evaluate classifier on translated B-test (T_BA(zB_test)) ---
+    # --- Evaluate classifier on translated B-test (B -> A via inverse flow) ---
     with torch.no_grad():
-        zB_to_A = T_BA(zB_test.to(device))
+        # T_BA here is actually the flow T_AB; we use its inverse as B->A
+        zB_to_A = T_BA.inverse(zB_test.to(device))
         logits_BA = clf(zB_to_A)
         preds_BA = logits_BA.argmax(dim=1).cpu()
         acc_BA = (preds_BA == y_test).float().mean().item()
 
-    print(f"Classifier accuracy on translated B-test (T_BA(zB_test)): {acc_BA:.4f}")
+    print(f"Classifier accuracy on translated B-test (T_BA(zB_test) via inverse flow): {acc_BA:.4f}")
 
 
 if __name__ == "__main__":

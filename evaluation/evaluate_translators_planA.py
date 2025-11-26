@@ -1,13 +1,13 @@
 import argparse
 import torch
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 from torchvision import datasets, transforms
 
-from models.simple_vae import VAE
-from training.train_translators_planA_adv import TranslatorMLP 
+from models.supervised_vae import SupervisedVAE
+from training.train_translators_planA_adv import TranslatorMLP, TranslatorFlow 
 
 
-def collect_latents(vae: VAE, loader: DataLoader, device: str, max_samples: int):
+def collect_latents(vae: SupervisedVAE, loader: DataLoader, device: str, max_samples: int):
     """Encode up to max_samples images into latent means."""
     vae.eval()
     latents = []
@@ -102,33 +102,34 @@ def main():
     ap.add_argument("--weights-TBA", type=str, default="checkpoints/mnist_split_T_BA.pt")
     ap.add_argument("--data-root", type=str, default="data/")
     ap.add_argument("--batch-size", type=int, default=256)
-    ap.add_argument("--max-samples", type=int, default=2000)
+    ap.add_argument("--max-samples", type=int, default=3000)
     ap.add_argument("--k-nn", type=int, default=10)
     args = ap.parse_args()
 
     device = args.device
 
     # Load VAEs
-    vaeA = VAE(latent_dim=args.latent_dim)
+    vaeA = SupervisedVAE(latent_dim=args.latent_dim)
     vaeA.load_state_dict(torch.load(args.weights_vaeA, map_location=device))
-    vaeB = VAE(latent_dim=args.latent_dim)
+    vaeB = SupervisedVAE(latent_dim=args.latent_dim)
     vaeB.load_state_dict(torch.load(args.weights_vaeB, map_location=device))
     vaeA.to(device)
     vaeB.to(device)
 
-    # Load translators
-    T_AB = TranslatorMLP(args.latent_dim)
+    # Load forward translator (flow)
+    T_AB = TranslatorFlow(args.latent_dim)
     T_AB.load_state_dict(torch.load(args.weights_TAB, map_location=device))
-    T_BA = TranslatorMLP(args.latent_dim)
-    T_BA.load_state_dict(torch.load(args.weights_TBA, map_location=device))
     T_AB.to(device).eval()
-    T_BA.to(device).eval()
 
     # --- Test set loader (hold-out) ---
     transform = transforms.ToTensor()
-    test_set = datasets.MNIST(
-        args.data_root, train=False, download=True, transform=transform
-    )
+    test_full = datasets.MNIST(args.data_root, train=False, download=True, transform=transform)
+
+    mask = (test_full.targets == 1) | (test_full.targets == 2) | (test_full.targets == 3)
+    filtered_idx = mask.nonzero(as_tuple=False).view(-1)
+
+    test_set = Subset(test_full, filtered_idx)
+
     test_loader = DataLoader(
         test_set, batch_size=args.batch_size, shuffle=False,
         num_workers=0, pin_memory=False
@@ -143,7 +144,7 @@ def main():
     # Map latents through translators
     with torch.no_grad():
         zA_mapped = T_AB(zA.to(device)).cpu()
-        zB_mapped = T_BA(zB.to(device)).cpu()
+        zB_mapped = T_AB.inverse(zB.to(device)).cpu()
 
     # --- Identity check: is T_AB ~ identity? ---
     with torch.no_grad():
@@ -177,25 +178,30 @@ def main():
     print(f"{args.k_nn}-NN overlap A (orig vs mapped, TEST): {overlap_A:.4f}")
     print(f"{args.k_nn}-NN overlap B (orig vs mapped, TEST): {overlap_B:.4f}")
 
-    # --- Class-mean alignment test ---
-    # Means in A and B (TEST)
-    mu_A = compute_class_means(zA, y_test, num_classes=10)        # (10, M)
-    mu_B = compute_class_means(zB, y_test, num_classes=10)        # (10, M)
+    # --- Class-mean alignment test for digits present ---
+    digits = sorted(y_test.unique().tolist())  
+
+    # Compute means for each digit in A and B
+    mu_A = torch.stack([zA[y_test == d].mean(dim=0) for d in digits], dim=0)  # (C, M)
+    mu_B = torch.stack([zB[y_test == d].mean(dim=0) for d in digits], dim=0)  # (C, M)
 
     with torch.no_grad():
-        mu_A_to_B = T_AB(mu_A.to(device)).cpu()                   # (10, M)
+        mu_A_to_B = T_AB(mu_A.to(device)).cpu()  # (C, M)
 
-    # For each digit k, find nearest class in B
+    # For each digit d, find nearest digit in B-space
     correct = 0
-    for k in range(10):
-        diffs = mu_B - mu_A_to_B[k]          # (10, M)
-        dists = diffs.pow(2).sum(dim=1).sqrt()  # (10,)
-        nearest = torch.argmin(dists).item()
-        print(f"Digit {k}: nearest in B-space is {nearest} (dist={dists[nearest].item():.4f})")
-        if nearest == k:
+    for i, d in enumerate(digits):
+        diffs = mu_B - mu_A_to_B[i]                      # (C, M)
+        dists = diffs.pow(2).sum(dim=1).sqrt()           # (C,)
+        j = torch.argmin(dists).item()
+        nearest_digit = digits[j]
+        print(f"Digit {d}: nearest in B-space is {nearest_digit} (dist={dists[j].item():.4f})")
+        if nearest_digit == d:
             correct += 1
 
-    print(f"Class-mean alignment accuracy (A→B): {correct}/10 = {correct/10:.2f}")
+    total_classes = len(digits)
+    print(f"Class-mean alignment accuracy (A→B): {correct}/{total_classes} = {correct/total_classes:.2f}")
+
 
 
 if __name__ == "__main__":

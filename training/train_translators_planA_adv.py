@@ -1,15 +1,18 @@
 import argparse
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader, Subset
 from torchvision import datasets, transforms
 
 from models.simple_vae import VAE
+from models.supervised_vae import SupervisedVAE
+
 
 
 # --------------------------------------------------------
-# Translator model
+# Translator model (old MLP – kept for reference)
 # --------------------------------------------------------
 class TranslatorMLP(nn.Module):
     def __init__(self, latent_dim: int):
@@ -24,6 +27,95 @@ class TranslatorMLP(nn.Module):
 
     def forward(self, z: torch.Tensor) -> torch.Tensor:
         return self.net(z)
+
+
+# -------------------------------------------------------
+# Affine coupling layer (RealNVP)
+# -------------------------------------------------------
+class CouplingLayer(nn.Module):
+    def __init__(self, dim, hidden=128, mask=None):
+        super().__init__()
+        self.dim = dim
+        # mask is registered as a buffer so it moves with .to(device)
+        self.register_buffer("mask", mask)
+
+        # scale and translation networks
+        self.scale_net = nn.Sequential(
+            nn.Linear(dim, hidden),
+            nn.ReLU(),
+            nn.Linear(hidden, dim),
+            nn.Tanh(),  # keeps scale stable
+        )
+
+        self.trans_net = nn.Sequential(
+            nn.Linear(dim, hidden),
+            nn.ReLU(),
+            nn.Linear(hidden, dim),
+        )
+
+    def forward(self, x):
+        # x: (batch, dim)
+        x_id = x * self.mask           # part that stays
+        x_change = x * (1.0 - self.mask)
+
+        s = self.scale_net(x_id)
+        t = self.trans_net(x_id)
+
+        y_change = x_change * torch.exp(s) + t
+        y = x_id + y_change * (1.0 - self.mask)
+        return y
+
+    def inverse(self, y):
+        y_id = y * self.mask
+        y_change = y * (1.0 - self.mask)
+
+        s = self.scale_net(y_id)
+        t = self.trans_net(y_id)
+
+        x_change = (y_change - t) * torch.exp(-s)
+        x = y_id + x_change * (1.0 - self.mask)
+        return x
+
+
+# -------------------------------------------------------
+# Full Translator Flow (stack of coupling layers) – bijective
+# -------------------------------------------------------
+class TranslatorFlow(nn.Module):
+    def __init__(self, latent_dim, num_layers=6):
+        super().__init__()
+        self.dim = latent_dim
+        self.layers = nn.ModuleList()
+
+        masks = []
+        for i in range(num_layers):
+            if i % 2 == 0:
+                mask = self._make_mask(latent_dim, left=True)
+            else:
+                mask = self._make_mask(latent_dim, left=False)
+            masks.append(mask)
+
+        for mask in masks:
+            self.layers.append(CouplingLayer(latent_dim, hidden=128, mask=mask))
+
+    def _make_mask(self, dim, left=True):
+        mask = torch.zeros(dim, dtype=torch.float32)
+        if left:
+            mask[: dim // 2] = 1.0
+        else:
+            mask[dim // 2 :] = 1.0
+        return mask
+
+    def forward(self, z):
+        # A -> B
+        for layer in self.layers:
+            z = layer(z)
+        return z
+
+    def inverse(self, z):
+        # B -> A
+        for layer in reversed(self.layers):
+            z = layer.inverse(z)
+        return z
 
 
 # --------------------------------------------------------
@@ -49,8 +141,8 @@ class LatentDiscriminator(nn.Module):
 # Geometry utilities
 # --------------------------------------------------------
 def pairwise_distances(z: torch.Tensor) -> torch.Tensor:
-    diff = z.unsqueeze(1) - z.unsqueeze(0)
-    return torch.norm(diff, dim=-1)
+    diff = z.unsqueeze(1) - z.unsqueeze(0)  # (n, n, d)
+    return torch.norm(diff, dim=-1)        # (n, n)
 
 
 def mmd_rbf(x: torch.Tensor, y: torch.Tensor, sigma: float = 1.0) -> torch.Tensor:
@@ -76,9 +168,17 @@ def make_domain_loaders(data_root: str, split_path: str, batch_size: int):
         download=True,
         transform=transform,
     )
+
+    # Restrict to digits 1,2,3
+    mask = (full_train.targets == 1) | (full_train.targets == 2) | (full_train.targets == 3)
+    filtered_indices = mask.nonzero(as_tuple=False).view(-1)
+    full_train = Subset(full_train, filtered_indices)
+
+    # Split indices are relative to this filtered subset
     split = torch.load(split_path)
     idxA = split["idxA"]
     idxB = split["idxB"]
+
     dsA = Subset(full_train, idxA)
     dsB = Subset(full_train, idxB)
 
@@ -91,6 +191,7 @@ def make_domain_loaders(data_root: str, split_path: str, batch_size: int):
     return loaderA, loaderB
 
 
+
 # --------------------------------------------------------
 # Main training function
 # --------------------------------------------------------
@@ -98,8 +199,8 @@ def train_translators(args):
     device = args.device
 
     # Load VAEs (frozen)
-    vaeA = VAE(latent_dim=args.latent_dim)
-    vaeB = VAE(latent_dim=args.latent_dim)
+    vaeA = SupervisedVAE(latent_dim=args.latent_dim)
+    vaeB = SupervisedVAE(latent_dim=args.latent_dim)
     vaeA.load_state_dict(torch.load(args.weights_vaeA, map_location=device))
     vaeB.load_state_dict(torch.load(args.weights_vaeB, map_location=device))
 
@@ -110,9 +211,8 @@ def train_translators(args):
     for p in vaeB.parameters():
         p.requires_grad = False
 
-    # Translators
-    T_AB = TranslatorMLP(args.latent_dim).to(device)
-    T_BA = TranslatorMLP(args.latent_dim).to(device)
+    # Translator: single bijective flow
+    T_AB = TranslatorFlow(args.latent_dim).to(device)
 
     # Discriminators (latent-domain)
     D_B_disc = LatentDiscriminator(args.latent_dim).to(device)
@@ -120,7 +220,7 @@ def train_translators(args):
 
     # Optimizers
     opt_T = optim.Adam(
-        list(T_AB.parameters()) + list(T_BA.parameters()),
+        T_AB.parameters(),
         lr=args.lr,
         weight_decay=args.weight_decay,
     )
@@ -163,15 +263,15 @@ def train_translators(args):
             zB, _ = vaeB.encode(xB)
 
         # ---------------------------
-        # Forward translations
+        # Forward translations (bijective)
         # ---------------------------
-        zA_B = T_AB(zA)  # A -> B
-        zB_A = T_BA(zB)  # B -> A
+        zA_B = T_AB(zA)          # A -> B
+        zB_A = T_AB.inverse(zB)  # B -> A
 
         # ---------------------------
-        # Cycle losses
+        # Cycle losses (Removed again)
         # ---------------------------
-        zA_cycle = T_BA(zA_B)
+        zA_cycle = T_AB.inverse(zA_B)
         zB_cycle = T_AB(zB_A)
 
         cycle_loss = (zA_cycle - zA).pow(2).mean() + (zB_cycle - zB).pow(2).mean()
@@ -223,7 +323,7 @@ def train_translators(args):
             loss_D.backward()
             opt_D.step()
 
-            # Train translators to fool discriminators
+            # Train translator to fool discriminators
             fake_B_for_T = D_B_disc(zA_B)
             fake_A_for_T = D_A_disc(zB_A)
 
@@ -254,7 +354,7 @@ def train_translators(args):
             log = (
                 f"[Step {step:5d}] "
                 f"Tot={loss_T.item():.4f} "
-                f"Cyc={cycle_loss.item():.4f} "
+                # f"Cyc={cycle_loss.item():.4f} "
                 f"Geo={geom_loss.item():.4f} "
             )
             if args.w_mmd > 0:
@@ -263,11 +363,9 @@ def train_translators(args):
             print(log)
 
     torch.save(T_AB.state_dict(), f"checkpoints/{args.out_prefix}_T_AB.pt")
-    torch.save(T_BA.state_dict(), f"checkpoints/{args.out_prefix}_T_BA.pt")
     torch.save(D_A_disc.state_dict(), f"checkpoints/{args.out_prefix}_D_A.pt")
     torch.save(D_B_disc.state_dict(), f"checkpoints/{args.out_prefix}_D_B.pt")
-    print("Saved translator + discriminator models.")
-
+    print("Saved translator (flow) + discriminator models.")
 
 
 def main():
@@ -283,7 +381,7 @@ def main():
     ap.add_argument("--lr", type=float, default=1e-3)
     ap.add_argument("--lr-disc", type=float, default=1e-3)
     ap.add_argument("--weight-decay", type=float, default=1e-5)
-    ap.add_argument("--w-cycle", type=float, default=1.0)
+    ap.add_argument("--w-cycle", type=float, default=0.0)
     ap.add_argument("--w-geom", type=float, default=0.1)
     ap.add_argument("--w-mmd", type=float, default=0.0)
     ap.add_argument("--w-adv", type=float, default=0.1)
