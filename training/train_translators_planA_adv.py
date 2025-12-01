@@ -1,12 +1,13 @@
 import argparse
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader, Subset
 from torchvision import datasets, transforms
 
+from models.simple_vae import VAE
 from models.supervised_vae import SupervisedVAE
-from torch.utils.data import TensorDataset
 
 
 
@@ -189,27 +190,6 @@ def make_domain_loaders(data_root: str, split_path: str, batch_size: int):
     )
     return loaderA, loaderB
 
-def make_latent_loaders(latentsA_path: str,
-                        latentsB_path: str,
-                        batch_size: int):
-    """
-    Build DataLoaders over *latent* datasets saved as:
-      {"z": (N, d), "y": (N,)}
-    """
-    dataA = torch.load(latentsA_path)
-    dataB = torch.load(latentsB_path)
-
-    zA, yA = dataA["z"], dataA["y"]
-    zB, yB = dataB["z"], dataB["y"]
-
-    dsA = TensorDataset(zA, yA)
-    dsB = TensorDataset(zB, yB)
-
-    loaderA = DataLoader(dsA, batch_size=batch_size,
-                         shuffle=True, num_workers=0, pin_memory=False)
-    loaderB = DataLoader(dsB, batch_size=batch_size,
-                         shuffle=True, num_workers=0, pin_memory=False)
-    return loaderA, loaderB
 
 
 # --------------------------------------------------------
@@ -220,12 +200,15 @@ def train_translators(args):
 
     # Load VAEs (frozen)
     vaeA = SupervisedVAE(latent_dim=args.latent_dim)
-    # vaeB = SupervisedVAE(latent_dim=args.latent_dim)
+    vaeB = SupervisedVAE(latent_dim=args.latent_dim)
     vaeA.load_state_dict(torch.load(args.weights_vaeA, map_location=device))
-    # vaeB.load_state_dict(torch.load(args.weights_vaeB, map_location=device))
+    vaeB.load_state_dict(torch.load(args.weights_vaeB, map_location=device))
 
     vaeA.to(device).eval()
+    vaeB.to(device).eval()
     for p in vaeA.parameters():
+        p.requires_grad = False
+    for p in vaeB.parameters():
         p.requires_grad = False
 
     # Translator: single bijective flow
@@ -234,12 +217,6 @@ def train_translators(args):
     # Discriminators (latent-domain)
     D_B_disc = LatentDiscriminator(args.latent_dim).to(device)
     D_A_disc = LatentDiscriminator(args.latent_dim).to(device)
-
-    # ------ semantic anchors: fixed structure in A/B latent spaces ------
-    anchors = torch.load(args.sem_anchors_path, map_location=device)
-    muA = anchors["muA"].to(device)               # (K, latent_dim)
-    muB = anchors["muB_aligned"].to(device)       # (K, latent_dim)
-    # digits = anchors["digits"]  # not used in the loss, but good for debugging
 
     # Optimizers
     opt_T = optim.Adam(
@@ -255,49 +232,41 @@ def train_translators(args):
 
     bce = nn.BCELoss()
 
-    # Latent loaders: only zA/zB and labels, no encoders
-    loaderA, loaderB = make_latent_loaders(
-        args.latentsA_path, args.latentsB_path, args.batch_size
+    # Data loaders
+    loaderA, loaderB = make_domain_loaders(
+        args.data_root, args.split_path, args.batch_size
     )
     iterA = iter(loaderA)
     iterB = iter(loaderB)
 
     for step in range(1, args.steps + 1):
         # ---------------------------
-        # Load latent batch (A, B)
+        # Load batch (A, B)
         # ---------------------------
         try:
-            zA, yA = next(iterA)
+            xA, _ = next(iterA)
         except StopIteration:
             iterA = iter(loaderA)
-            zA, yA = next(iterA)
+            xA, _ = next(iterA)
 
         try:
-            zB, yB = next(iterB)
+            xB, _ = next(iterB)
         except StopIteration:
             iterB = iter(loaderB)
-            zB, yB = next(iterB)
+            xB, _ = next(iterB)
 
-        zA = zA.to(device)
-        zB = zB.to(device)
-        yA = yA.to(device)
-        yB = yB.to(device)
+        xA = xA.to(device)
+        xB = xB.to(device)
+
+        with torch.no_grad():
+            zA, _ = vaeA.encode(xA)
+            zB, _ = vaeB.encode(xB)
 
         # ---------------------------
         # Forward translations (bijective)
         # ---------------------------
         zA_B = T_AB(zA)          # A -> B
         zB_A = T_AB.inverse(zB)  # B -> A
-
-        # ----------------------------------------------------
-        # Semantic loss – anchor based
-        # ----------------------------------------------------
-        # Map B’s cluster centers into A’s latent space
-        muB_in_A = T_AB.inverse(muB)          # (K, latent_dim)
-
-        # Force each mapped B-cluster center to match A’s class mean
-        sem_loss = (muB_in_A - muA).pow(2).mean()
-
 
         # ---------------------------
         # Cycle losses (Removed again)
@@ -367,37 +336,6 @@ def train_translators(args):
         else:
             adv_loss = torch.tensor(0.0, device=device)
 
-        # # ---------------------------
-        # # Semantic loss (A labels only)
-        # # ---------------------------
-        # # 1) Compute class means in A's latent space for this batch
-        # unique_labels = torch.unique(yA)
-        # class_means = []
-        # for lbl in unique_labels:
-        #     mask = (yA == lbl)
-        #     class_means.append(zA[mask].mean(dim=0))
-        # mu_A = torch.stack(class_means, dim=0)  # (C, dim)
-
-        # # Map each A-sample to its class mean (tighten A clusters)
-        # label_to_index = {int(lbl.item()): i for i, lbl in enumerate(unique_labels)}
-        # idx = torch.tensor(
-        #     [label_to_index[int(lbl.item())] for lbl in yA],
-        #     device=device,
-        #     dtype=torch.long,
-        # )
-        # mu_for_A = mu_A[idx]                     # (N_A, dim)
-        # sem_A = (zA - mu_for_A).pow(2).sum(dim=1).mean()
-
-        # # 2) For translated B->A latents, pull each point towards its
-        # #    nearest A-class mean (not using B labels)
-        # diff_B = zB_A.unsqueeze(1) - mu_A.unsqueeze(0)  # (N_B, C, dim)
-        # dist2_B = diff_B.pow(2).sum(dim=2)              # (N_B, C)
-        # min_dist2_B, _ = dist2_B.min(dim=1)             # (N_B,)
-        # sem_B = min_dist2_B.mean()
-
-        # sem_loss = sem_A + sem_B
-
-
         # ---------------------------
         # Total translator loss
         # ---------------------------
@@ -406,7 +344,6 @@ def train_translators(args):
             + args.w_geom * geom_loss
             + args.w_mmd * mmd_loss
             + args.w_adv * adv_loss
-            + args.w_sem * sem_loss
         )
 
         opt_T.zero_grad()
@@ -419,7 +356,6 @@ def train_translators(args):
                 f"Tot={loss_T.item():.4f} "
                 # f"Cyc={cycle_loss.item():.4f} "
                 f"Geo={geom_loss.item():.4f} "
-                f"Sem={sem_loss.item():.4f} "
             )
             if args.w_mmd > 0:
                 log += f"MMD={mmd_loss.item():.4f} "
@@ -439,20 +375,16 @@ def main():
     ap.add_argument("--weights-vaeA", type=str, default="checkpoints/mnist_split_vaeA.pt")
     ap.add_argument("--weights-vaeB", type=str, default="checkpoints/mnist_split_vaeB.pt")
     ap.add_argument("--split-path", type=str, default="checkpoints/mnist_split_split_indices.pt")
-    ap.add_argument("--latentsA-path", type=str, default="checkpoints/mnist_split_zA_train.pt")
-    ap.add_argument("--latentsB-path", type=str, default="checkpoints/mnist_split_zB_train.pt")
-    ap.add_argument("--sem-anchors-path", type=str, default="checkpoints/mnist_split_sem_anchors.pt")
     ap.add_argument("--data-root", type=str, default="data/")
     ap.add_argument("--batch-size", type=int, default=128)
-    ap.add_argument("--steps", type=int, default=3000)
+    ap.add_argument("--steps", type=int, default=5000)
     ap.add_argument("--lr", type=float, default=1e-3)
     ap.add_argument("--lr-disc", type=float, default=1e-3)
     ap.add_argument("--weight-decay", type=float, default=1e-5)
     ap.add_argument("--w-cycle", type=float, default=0.0)
-    ap.add_argument("--w-geom", type=float, default=0.7)
+    ap.add_argument("--w-geom", type=float, default=0.1)
     ap.add_argument("--w-mmd", type=float, default=0.0)
-    ap.add_argument("--w-adv", type=float, default=0.3)
-    ap.add_argument("--w-sem", type=float, default=0.1)
+    ap.add_argument("--w-adv", type=float, default=0.1)
     ap.add_argument("--mmd-sigma", type=float, default=1.0)
     ap.add_argument("--log-every", type=int, default=50)
     ap.add_argument("--out-prefix", type=str, default="mnist_split")
